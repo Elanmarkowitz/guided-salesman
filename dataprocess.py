@@ -81,6 +81,7 @@ class TSPDirectionDataloader(DataLoader):
         adjacencies = []
         features = []
         ys = []
+        graph_sizes = []
         for graph, cur, tour in batch:
             graph = torch.tensor(graph)
             tour = torch.tensor(tour)
@@ -108,10 +109,13 @@ class TSPDirectionDataloader(DataLoader):
             adjacencies.append(A)
             features.append(feat)
             ys.append(y_one_hot)
+            graph_start = 0 if graph_sizes == [] else graph_sizes[-1][1] + 1
+            graph_stop = graph_start + graph.size(0)
+            graph_sizes.append((graph_start, graph_stop))
         full_adjacency = self.combine_adjacencies(adjacencies)
         full_feats = torch.cat(features)
         ys = torch.cat(ys)
-        return full_feats, full_adjacency, ys
+        return full_feats, full_adjacency, ys, graph_sizes
 
     @staticmethod
     def to_sparse_parts(x):
@@ -177,6 +181,7 @@ class TSPNeighborhoodDataloader(TSPDirectionDataloader):
         adjacencies = []
         features = []
         neighborhoods = []
+        graph_sizes = []
         for graph, cur, tour in batch:
             graph = torch.tensor(graph)
             tour = torch.tensor(tour)
@@ -214,10 +219,13 @@ class TSPNeighborhoodDataloader(TSPDirectionDataloader):
             adjacencies.append(A)
             features.append(feat)
             neighborhoods.append(neighborhood_label)
+            graph_start = 0 if graph_sizes == [] else graph_sizes[-1][1] + 1
+            graph_stop = graph_start + graph.size(0)
+            graph_sizes.append((graph_start, graph_stop))
         full_adjacency = self.combine_adjacencies(adjacencies)
         full_feats = torch.cat(features)
         neighborhoods = torch.cat(neighborhoods)
-        return full_feats, full_adjacency, neighborhoods
+        return full_feats, full_adjacency, neighborhoods, graph_sizes
 
     def sample_direction(self, tour, lower_factor_bound=0.5, upper_factor_bound=2):
         step_count = np.random.triangular(self.L_steps * lower_factor_bound, 
