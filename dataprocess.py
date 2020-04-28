@@ -185,11 +185,18 @@ class TSPNeighborhoodDataloader(TSPDirectionDataloader):
             x_cur = graph[cur]
             graph = graph - x_cur  # center graph on current node
             
+            dir_node, num_steps = self.sample_direction(tour)
+            direction = graph[dir_node]
+            dir_node_one_hot = torch.eye(graph.size(0))[dir_node]
+
+
             neighborhood = tour[1:self.L_steps + 1].long()
             neighborhood_label = torch.zeros(size = (graph.size(0),))
             neighborhood_label[neighborhood] = 1.0
 
             tour_len = self.sample_tour_len(tour, self.L_steps)
+            tour_len = max([tour_len, num_steps])
+
             tour = tour[:tour_len].long()
 
             final_dest = tour[-1]
@@ -199,8 +206,10 @@ class TSPNeighborhoodDataloader(TSPDirectionDataloader):
             graph = graph / graph.norm(p=2, dim=1).max()
             neighborhood_label = neighborhood_label[tour].float()
             cur_one_hot = cur_one_hot[tour].unsqueeze(-1).float()
+            dir_node_one_hot = dir_node_one_hot[tour].unsqueeze(-1).float()
+            direction = direction.float().repeat(graph.size(0)).reshape(-1,2)
             final_dest_one_hot = final_dest_one_hot[tour].unsqueeze(-1).float()
-            feat = torch.cat([cur_one_hot, final_dest_one_hot, graph], dim=1)
+            feat = torch.cat([cur_one_hot, final_dest_one_hot, graph, dir_node_one_hot, direction], dim=1)
             A = self.weighted_adj_from_pos(graph)
             adjacencies.append(A)
             features.append(feat)
@@ -209,26 +218,37 @@ class TSPNeighborhoodDataloader(TSPDirectionDataloader):
         full_feats = torch.cat(features)
         neighborhoods = torch.cat(neighborhoods)
         return full_feats, full_adjacency, neighborhoods
+
+    def sample_direction(self, tour, lower_factor_bound=0.5, upper_factor_bound=2):
+        step_count = np.random.triangular(self.L_steps * lower_factor_bound, 
+                                          self.L_steps, 
+                                          self.L_steps * upper_factor_bound)
+        step_count = min([tour.size(0)-1, int(np.round(step_count))])
+        node =  tour[step_count]
+        return node, step_count
     
 
         
 
         
-    
-dataset = TSPDataset(DATADIR)
-dir_dataloader = TSPDirectionDataloader(dataset, batch_size=3)
+if __name__ == '__main__':
+    dataset = TSPDataset(DATADIR)
+    dir_dataloader = TSPDirectionDataloader(dataset, batch_size=3)
 
-neighborhood_dataloader = TSPNeighborhoodDataloader(dataset, batch_size=3)
+    neighborhood_dataloader = TSPNeighborhoodDataloader(dataset, batch_size=3)
 
-breakpoint()
-
-for feats, full_A, y in dir_dataloader:
-    print(feats.shape)
-    break
-
-for feats, full_A, neighborhoods in neighborhood_dataloader:
-    print(neighborhoods.shape)
-    break
+    from tqdm.auto import tqdm 
+    pbar = tqdm(total=len(dir_dataloader))
+    for feats, full_A, y in dir_dataloader:
+        pbar.update(1)
+        continue
+    pbar.close()
+    from tqdm.auto import tqdm 
+    pbar = tqdm(total=len(neighborhood_dataloader))
+    for feats, full_A, neighborhoods in neighborhood_dataloader:
+        pbar.update(1)
+        continue
+    pbar.close()
 
 
 
