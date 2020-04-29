@@ -89,9 +89,6 @@ class TSPDirectionDataloader(DataLoader):
             cur_one_hot = torch.eye(graph.size(0))[cur]
             x_cur = graph[cur]
             graph = graph - x_cur  # center graph on current node
-            
-            y = tour[self.L_steps]
-            y_one_hot = torch.eye(graph.size(0))[y]
 
             tour_len = self.sample_tour_len(tour, self.L_steps)
             tour = tour[:tour_len].long()
@@ -100,21 +97,26 @@ class TSPDirectionDataloader(DataLoader):
             final_dest_one_hot = torch.eye(graph.size(0))[final_dest]
             
             graph = graph[tour].float()
-            graph = graph / graph.norm(p=2, dim=1).max()
-            y_one_hot = y_one_hot[tour].float()
+            graph = self.normalize_graph_scale(graph)
+            graph = self.rotate_graph(graph)
+
+            # y_one_hot = y_one_hot[tour].float()
             cur_one_hot = cur_one_hot[tour].unsqueeze(-1).float()
             final_dest_one_hot = final_dest_one_hot[tour].unsqueeze(-1).float()
-            feat = torch.cat([cur_one_hot, final_dest_one_hot, graph], dim=1)
+            final_dest_coord = graph[-1]
+            final_dest_coord = final_dest_coord.repeat(graph.size(0)).reshape(-1,2)
+            feat = torch.cat([cur_one_hot, final_dest_one_hot, final_dest_coord, graph], dim=1)
             A = self.weighted_adj_from_pos(graph)
             adjacencies.append(A)
             features.append(feat)
-            ys.append(y_one_hot)
-            graph_start = 0 if graph_sizes == [] else graph_sizes[-1][1] + 1
+            direction = graph[self.L_steps]
+            ys.append(direction) 
+            graph_start = 0 if graph_sizes == [] else graph_sizes[-1][1]
             graph_stop = graph_start + graph.size(0)
             graph_sizes.append((graph_start, graph_stop))
         full_adjacency = self.combine_adjacencies(adjacencies)
         full_feats = torch.cat(features)
-        ys = torch.cat(ys)
+
         return full_feats, full_adjacency, ys, graph_sizes
 
     @staticmethod
@@ -150,6 +152,17 @@ class TSPDirectionDataloader(DataLoader):
         return tour_len
 
     @staticmethod
+    def normalize_graph_scale(graph):
+        return graph / graph.norm(p=2, dim=1).max()
+
+    @staticmethod
+    def rotate_graph(graph):
+        radians = torch.rand(())*2*np.pi
+        c, s = torch.cos(radians), torch.sin(radians)
+        rotation_matrix = torch.tensor([[c, -s], [s, c]])
+        return torch.mm(graph, rotation_matrix)
+
+    @staticmethod
     def weighted_adj_from_pos(graph):
         """
         Constucts a weighted, normalized adjacency matrix from the node coordinates
@@ -161,7 +174,7 @@ class TSPDirectionDataloader(DataLoader):
         g2 = graph.unsqueeze(1)
         distances = (g1 - g2).norm(p=2, dim=2)
         weighted = 1 / distances
-        weighted[torch.arange(size), torch.arange(size)] = torch.zeros(size)
+        weighted[torch.isinf(weighted)] = 0.0  # replace Infs (duplicate points and self-distances)
         # TODO: May want to experiment with non row-based normalization
         normalized = weighted / weighted.sum(0).expand_as(weighted).T
         normalized = normalized / 2
@@ -189,11 +202,8 @@ class TSPNeighborhoodDataloader(TSPDirectionDataloader):
             cur_one_hot = torch.eye(graph.size(0))[cur]
             x_cur = graph[cur]
             graph = graph - x_cur  # center graph on current node
-            
-            dir_node, num_steps = self.sample_direction(tour)
-            direction = graph[dir_node]
-            dir_node_one_hot = torch.eye(graph.size(0))[dir_node]
 
+            dir_node, num_steps = self.sample_direction(tour)
 
             neighborhood = tour[1:self.L_steps + 1].long()
             neighborhood_label = torch.zeros(size = (graph.size(0),))
@@ -206,15 +216,19 @@ class TSPNeighborhoodDataloader(TSPDirectionDataloader):
 
             final_dest = tour[-1]
             final_dest_one_hot = torch.eye(graph.size(0))[final_dest]
-            
+
             graph = graph[tour].float()
-            graph = graph / graph.norm(p=2, dim=1).max()
+            graph = self.normalize_graph_scale(graph)
+            graph = self.rotate_graph(graph)
+            
             neighborhood_label = neighborhood_label[tour].float()
             cur_one_hot = cur_one_hot[tour].unsqueeze(-1).float()
-            dir_node_one_hot = dir_node_one_hot[tour].unsqueeze(-1).float()
+            direction = graph[num_steps]
             direction = direction.float().repeat(graph.size(0)).reshape(-1,2)
             final_dest_one_hot = final_dest_one_hot[tour].unsqueeze(-1).float()
-            feat = torch.cat([cur_one_hot, final_dest_one_hot, graph, dir_node_one_hot, direction], dim=1)
+            final_dest_coord = graph[-1]
+            final_dest_coord = final_dest_coord.repeat(graph.size(0)).reshape(-1,2)
+            feat = torch.cat([cur_one_hot, final_dest_one_hot, final_dest_coord, graph, direction], dim=1)
             A = self.weighted_adj_from_pos(graph)
             adjacencies.append(A)
             features.append(feat)
@@ -225,6 +239,7 @@ class TSPNeighborhoodDataloader(TSPDirectionDataloader):
         full_adjacency = self.combine_adjacencies(adjacencies)
         full_feats = torch.cat(features)
         neighborhoods = torch.cat(neighborhoods)
+
         return full_feats, full_adjacency, neighborhoods, graph_sizes
 
     def sample_direction(self, tour, lower_factor_bound=0.5, upper_factor_bound=2):
@@ -241,19 +256,19 @@ class TSPNeighborhoodDataloader(TSPDirectionDataloader):
         
 if __name__ == '__main__':
     dataset = TSPDataset(DATADIR)
-    dir_dataloader = TSPDirectionDataloader(dataset, batch_size=3)
+    dir_dataloader = TSPDirectionDataloader(dataset, batch_size=8)
 
-    neighborhood_dataloader = TSPNeighborhoodDataloader(dataset, batch_size=3)
+    neighborhood_dataloader = TSPNeighborhoodDataloader(dataset, batch_size=8)
 
     from tqdm.auto import tqdm 
     pbar = tqdm(total=len(dir_dataloader))
-    for feats, full_A, y in dir_dataloader:
+    for batch in dir_dataloader:
         pbar.update(1)
         continue
     pbar.close()
     from tqdm.auto import tqdm 
     pbar = tqdm(total=len(neighborhood_dataloader))
-    for feats, full_A, neighborhoods in neighborhood_dataloader:
+    for batch in neighborhood_dataloader:
         pbar.update(1)
         continue
     pbar.close()
