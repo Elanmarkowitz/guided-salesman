@@ -3,6 +3,7 @@ Based on https://github.com/tkipf/pygcn
 """
 from __future__ import print_function
 
+import os
 import time
 import argparse
 import numpy as np
@@ -43,6 +44,12 @@ parser.add_argument('--train_direction', action='store_true', default=False,
                     help='Indicates to skip training of direction model.')
 parser.add_argument('--train_neighborhood', action='store_true', default=False,
                     help='Indicates to skip training of neighborhood model.')
+parser.add_argument('--checkpoint_dir', type=str, default=None,
+                    help='Activates checkpointing of model during training')
+parser.add_argument('--use_checkpoint', type=str, default=None,
+                    help='Indicates what file to load checkpoint from (within checkpoint_dir if given).')
+parser.add_argument('--model_name', type=str, default="")
+
 
 args = parser.parse_args()
 args.cuda = not args.no_cuda and torch.cuda.is_available()
@@ -59,13 +66,41 @@ if args.cuda:
 # Load data
 dataset = TSPDataset(args.datadir)
 
+def save_checkpoint(model, opt, epoch, trainingtype, diversity_loss):
+    if args.checkpoint_dir is not None:
+        if not os.path.isdir(args.checkpoint_dir):
+            os.mkdir(args.checkpoint_dir)
+        filename = f'{args.model_name}_{trainingtype}_{epoch}.cpk'
+        filename = os.path.join(args.checkpoint_dir, filename)
+        state = {'epoch': epoch, 'state_dict': model.state_dict(),
+                 'optimizer': opt.state_dict()}
+        torch.save(state, filename)
 
+def load_checkpoint(model, optimizer):
+    start_epoch = 0
+    if args.use_checkpoint is not None:
+        filename = args.use_checkpoint
+        if args.checkpoint_dir:
+            filename = os.path.join(args.checkpoint_dir, filename)
+        if os.path.isfile(filename):
+            print("=> loading checkpoint '{}'".format(filename))
+            checkpoint = torch.load(filename)
+            start_epoch = checkpoint['epoch']
+            model.load_state_dict(checkpoint['state_dict'])
+            optimizer.load_state_dict(checkpoint['optimizer'])
+            print("=> loaded checkpoint '{}' (epoch {})"
+                    .format(filename, checkpoint['epoch']))
+        else:
+            print("=> no checkpoint found at '{}'".format(filename))
+    return start_epoch
+        
 def train(model, dataloader, epochs, optimizer, trainingtype, use_diversity_loss=True):
+    start_epoch = load_checkpoint(model, optimizer)
     if args.cuda:
         model.cuda()
     pbar = tqdm(total=epochs*len(dataloader))
     pbar.update(0)
-    for e in range(epochs):
+    for e in range(start_epoch, epochs):
         t = time.time()
         model.train()
 
@@ -80,6 +115,7 @@ def train(model, dataloader, epochs, optimizer, trainingtype, use_diversity_loss
             output = model(features, full_adj)
 
             total_loss = torch.tensor(0.0)
+            mean_acc = []
             if args.cuda:
                 total_loss = total_loss.cuda()
             for (start, stop), label in zip(graph_sizes, labels):
@@ -87,21 +123,28 @@ def train(model, dataloader, epochs, optimizer, trainingtype, use_diversity_loss
                     out_dir = output[:,start:stop].mean(1)
                     d = (out_dir - label).norm(p=2, dim=1)
                     loss = d**2
+                    acc = d.min()
+                    mean_acc.append(acc)
                 elif trainingtype == 'neighborhood':
                     outpreds = output[:,start:stop].squeeze(-1)
-                    labs = labels[start:stop].expand_as(outpreds)
+                    labs = label.expand_as(outpreds)
                     loss = F.binary_cross_entropy_with_logits(outpreds, labs)
+                    acc = ((F.sigmoid(outpreds.mean(0)) - label).abs() < 0.5).sum().float() / label.size(0)
+                    mean_acc.append(acc)
                 if use_diversity_loss:
                     loss = torch.min(loss)
                 else:
                     loss = torch.sum(loss)
                 total_loss += loss 
+            mean_acc = sum(mean_acc) / len(mean_acc)  
 
-            pbar.write(f'Loss: {total_loss.cpu().detach().numpy()}')
+            pbar.write(f'Loss: {total_loss.cpu().detach().numpy()}'
+                        f'\tAcc: {mean_acc.cpu().detach().numpy()}')
 
             total_loss.backward()
             optimizer.step()
 
+        save_checkpoint(model, optimizer, e+1, trainingtype, use_diversity_loss)
         # if not args.fastmode:
         #     # Evaluate validation set performance separately,
         #     # deactivates dropout during validation run.
@@ -137,7 +180,7 @@ if args.train_direction:
                            dropout=args.dropout)
     optimizer = optim.Adam(dir_model.parameters(),
                            lr=args.lr, weight_decay=args.weight_decay)
-    dir_dataloader = TSPDirectionDataloader(dataset, batch_size=args.batch_size, shuffle=True)
+    dir_dataloader = TSPDirectionDataloader(dataset, use_cuda=args.cuda, batch_size=args.batch_size, shuffle=True)
     train(dir_model, dir_dataloader, args.epochs, optimizer, 'direction', use_diversity_loss=True)
 
 
@@ -149,7 +192,7 @@ if args.train_neighborhood:
                            dropout=args.dropout)
     optimizer = optim.Adam(nbr_model.parameters(),
                            lr=args.lr, weight_decay=args.weight_decay)
-    nbr_dataloader = TSPNeighborhoodDataloader(dataset, batch_size=args.batch_size, shuffle=True)
+    nbr_dataloader = TSPNeighborhoodDataloader(dataset, use_cuda=args.cuda, batch_size=args.batch_size, shuffle=True)
     train(nbr_model, nbr_dataloader, args.epochs, optimizer, 'neighborhood', use_diversity_loss=True)
 
 import pdb; pdb.set_trace()

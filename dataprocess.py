@@ -72,10 +72,14 @@ class TSPDataset(Dataset):
 
 class TSPDirectionDataloader(DataLoader):
 
-    def __init__(self, *args, L_steps=20, **kwargs):
+    def __init__(self, *args, L_steps=20, use_cuda=False, **kwargs):
         super().__init__(*args, **kwargs)
         self.L_steps = L_steps
+        self.use_cuda = use_cuda
         self.collate_fn = self._collate_fn
+
+    def _cuda(self, t):
+        return t.cuda() if self.use_cuda and torch.cuda.is_available() else t
 
     def _collate_fn(self, batch):
         adjacencies = []
@@ -83,10 +87,10 @@ class TSPDirectionDataloader(DataLoader):
         ys = []
         graph_sizes = []
         for graph, cur, tour in batch:
-            graph = torch.tensor(graph)
-            tour = torch.tensor(tour)
+            graph = self._cuda(torch.tensor(graph))
+            tour = self._cuda(torch.tensor(tour))
 
-            cur_one_hot = torch.eye(graph.size(0))[cur]
+            cur_one_hot = self._cuda(torch.eye(graph.size(0))[cur])
             x_cur = graph[cur]
             graph = graph - x_cur  # center graph on current node
 
@@ -94,7 +98,7 @@ class TSPDirectionDataloader(DataLoader):
             tour = tour[:tour_len].long()
 
             final_dest = tour[-1]
-            final_dest_one_hot = torch.eye(graph.size(0))[final_dest]
+            final_dest_one_hot = self._cuda(torch.eye(graph.size(0))[final_dest])
             
             graph = graph[tour].float()
             graph = self.normalize_graph_scale(graph)
@@ -155,15 +159,13 @@ class TSPDirectionDataloader(DataLoader):
     def normalize_graph_scale(graph):
         return graph / graph.norm(p=2, dim=1).max()
 
-    @staticmethod
-    def rotate_graph(graph):
+    def rotate_graph(self, graph):
         radians = torch.rand(())*2*np.pi
         c, s = torch.cos(radians), torch.sin(radians)
-        rotation_matrix = torch.tensor([[c, -s], [s, c]])
+        rotation_matrix = self._cuda(torch.tensor([[c, -s], [s, c]]))
         return torch.mm(graph, rotation_matrix)
 
-    @staticmethod
-    def weighted_adj_from_pos(graph):
+    def weighted_adj_from_pos(self, graph):
         """
         Constucts a weighted, normalized adjacency matrix from the node coordinates
         graph: |G| x 2 tensor
@@ -179,7 +181,8 @@ class TSPDirectionDataloader(DataLoader):
         normalized = weighted / weighted.sum(0).expand_as(weighted).T
         normalized = normalized / 2
         if True:  # self-loops?
-            normalized[torch.arange(size), torch.arange(size)] = torch.ones(size) / 2
+            idx_range = self._cuda(torch.arange(size))
+            normalized[idx_range, idx_range] = self._cuda(torch.ones(size)) / 2
         return normalized
 
 
@@ -196,26 +199,26 @@ class TSPNeighborhoodDataloader(TSPDirectionDataloader):
         neighborhoods = []
         graph_sizes = []
         for graph, cur, tour in batch:
-            graph = torch.tensor(graph)
-            tour = torch.tensor(tour)
+            graph = self._cuda(torch.tensor(graph))
+            tour = self._cuda(torch.tensor(tour))
 
-            cur_one_hot = torch.eye(graph.size(0))[cur]
+            cur_one_hot = self._cuda(torch.eye(graph.size(0))[cur])
             x_cur = graph[cur]
             graph = graph - x_cur  # center graph on current node
 
             dir_node, num_steps = self.sample_direction(tour)
 
             neighborhood = tour[1:self.L_steps + 1].long()
-            neighborhood_label = torch.zeros(size = (graph.size(0),))
+            neighborhood_label = self._cuda(torch.zeros(size = (graph.size(0),)))
             neighborhood_label[neighborhood] = 1.0
 
             tour_len = self.sample_tour_len(tour, self.L_steps)
-            tour_len = max([tour_len, num_steps])
+            tour_len = max([tour_len, num_steps + 1])
 
             tour = tour[:tour_len].long()
 
             final_dest = tour[-1]
-            final_dest_one_hot = torch.eye(graph.size(0))[final_dest]
+            final_dest_one_hot = self._cuda(torch.eye(graph.size(0))[final_dest])
 
             graph = graph[tour].float()
             graph = self.normalize_graph_scale(graph)
@@ -233,12 +236,11 @@ class TSPNeighborhoodDataloader(TSPDirectionDataloader):
             adjacencies.append(A)
             features.append(feat)
             neighborhoods.append(neighborhood_label)
-            graph_start = 0 if graph_sizes == [] else graph_sizes[-1][1] + 1
+            graph_start = 0 if graph_sizes == [] else graph_sizes[-1][1]
             graph_stop = graph_start + graph.size(0)
             graph_sizes.append((graph_start, graph_stop))
         full_adjacency = self.combine_adjacencies(adjacencies)
         full_feats = torch.cat(features)
-        neighborhoods = torch.cat(neighborhoods)
 
         return full_feats, full_adjacency, neighborhoods, graph_sizes
 
@@ -256,9 +258,9 @@ class TSPNeighborhoodDataloader(TSPDirectionDataloader):
         
 if __name__ == '__main__':
     dataset = TSPDataset(DATADIR)
-    dir_dataloader = TSPDirectionDataloader(dataset, batch_size=8)
+    dir_dataloader = TSPDirectionDataloader(dataset, use_cuda=True, batch_size=8, shuffle=True)
 
-    neighborhood_dataloader = TSPNeighborhoodDataloader(dataset, batch_size=8)
+    neighborhood_dataloader = TSPNeighborhoodDataloader(dataset, use_cuda=True, batch_size=8, shuffle=True)
 
     from tqdm.auto import tqdm 
     pbar = tqdm(total=len(dir_dataloader))
