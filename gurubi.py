@@ -38,6 +38,23 @@ def subtour(edges, n):
             cycle = thiscycle
     return cycle
 
+def subtour_debug(edges, n):
+    breakpoint()
+    unvisited = list(range(n))
+    cycle = range(n+1)  # initial length has 1 more city
+    while unvisited:  # true if list is non-empty
+        thiscycle = []
+        neighbors = unvisited
+        while neighbors:
+            current = neighbors[0]
+            thiscycle.append(current)
+            unvisited.remove(current)
+            neighbors = [j for i, j in edges.select(current, '*')
+                         if j in unvisited]
+        if len(cycle) > len(thiscycle):
+            cycle = thiscycle
+    return cycle
+
 
 def solve_gs_subtour(coords, direction, start):
 
@@ -56,7 +73,6 @@ def solve_gs_subtour(coords, direction, start):
                                         for i, j in combinations(tour, 2))
                             <= len(tour)-1)
 
-
     # (torch.Tensor, torch.Tensor, int) -> ...
     direction = direction.unsqueeze(0)
     size = coords.size(0)
@@ -73,8 +89,10 @@ def solve_gs_subtour(coords, direction, start):
     
     # add dummy coordinate to ensure source and sink
     dummy = size + 1
+    for i in range(dummy):
+        dist[i, dummy] = 10000000
     dist[size, dummy] = 0 
-    dist[dummy, start] = 0
+    dist[start, dummy] = 0
     num_nodes = dummy + 1
     
     m = gp.Model()
@@ -86,20 +104,34 @@ def solve_gs_subtour(coords, direction, start):
     
 
     # Add degree-2 constraint
-    m.addConstrs(vars.sum(i, '*') == 2 for i in range(size + 1))
+    m.addConstrs(vars.sum(i, '*') == 2 for i in range(num_nodes))
 
     # Optimize model
     m._vars = vars
+    m.setParam('OutputFlag', 0)  # Silence!
     m.Params.lazyConstraints = 1
     m.optimize(subtourelim)
 
     vals = m.getAttr('x', vars)
     selected = gp.tuplelist((i, j) for i, j in vals.keys() if vals[i, j] > 0.5)
 
-    tour = subtour(selected, size + 2)
+    tour = subtour(selected, num_nodes)
+
+    if len(tour) != num_nodes:
+        breakpoint() 
     assert len(tour) == num_nodes 
 
-    tour = tour[:size]  # subtour always starts with 0. 
+    # Adjust so that points to direction node
+    if tour[-1] == dummy:
+        tour = tour[:-1]
+    elif tour[1] == dummy:
+        tour = tour[0:1] + tour[2:][::-1]
+    else:
+        breakpoint()
+        # dummy should be next to 0
+
+    assert tour[-1] == size  # last node should be direction
+    tour = tour[:-1]
 
     return tour, m.objVal
 

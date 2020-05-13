@@ -18,14 +18,35 @@ def two_opt(route, cost_mat):
         route = best
     return best
 
-
+import solver 
+import torch
+import time
+from tqdm.auto import tqdm
 if __name__ == '__main__':
+    np.random.seed(1234321)
     nodes = 1000
-    init_route = list(range(nodes))
-    print(init_route)
-    cost_mat = np.random.randint(100, size=(nodes, nodes))
-    cost_mat += cost_mat.T
-    np.fill_diagonal(cost_mat, 0)
-    cost_mat = list(cost_mat)
-    best_route = two_opt(init_route, cost_mat)
-    print(best_route)
+    tsp_problems = np.random.uniform(size=(100, nodes, 2))
+    results = []
+    times = []
+    pbar = tqdm(total=100)
+    pbar.update(0)
+    for prob in tsp_problems:
+        pbar.update(1)
+        p = solver.TSPProblem(torch.tensor(prob))
+        init_route = list(range(nodes))
+        cost_mat = p.distances.numpy()
+        cost_mat = list(cost_mat)
+        start = time.time()
+        best_route = two_opt(init_route, cost_mat)
+        end = time.time()
+        cycle = best_route + [best_route[0]]
+        total_len = 0
+        for i, j in zip(cycle[:-1], cycle[1:]):
+            total_len += cost_mat[i][j]
+        results.append(total_len)
+        times.append(end - start)
+    pbar.close()
+    mean_time = np.array(times).mean().item()
+    mean_len = np.array(results).mean().item()
+    print(f'time: {mean_time}')
+    print(f'length: {mean_len}')

@@ -3,11 +3,15 @@
 import argparse
 import numpy as np 
 import torch
+import time
+import math 
+import json 
 
 from pygcn.models import GCN
 from pygcn.multi_model import MultiModel
 import dataprocess
 import gurubi
+from two_opt import two_opt
 
 parser = argparse.ArgumentParser()
 parser.add_argument('--dir_model', type=str,
@@ -22,35 +26,9 @@ parser.add_argument('--set_seed', type=int, default=0,
                     help='Set to positive integer if seed desired.')
 parser.add_argument('--max_expansion', type=int, default=2)
 parser.add_argument('--max_solutions', type=int, default=1024)
-args = parser.parse_args()
-args.cuda = not args.no_cuda and torch.cuda.is_available()
-
-dir_cpk = torch.load(args.dir_model)
-ngb_cpk = torch.load(args.neighbor_model)
-
-dir_model = MultiModel(GCN, dir_cpk.params.n_models, 
-                       nfeat=dir_cpk.params.nfeat,
-                       nhid=dir_cpk.params.nhid,
-                       nlayers=dir_cpk.params.nlayers,
-                       nclass=dir_cpk.params.nclass, 
-                       dropout=dir_cpk.params.dropout)
-                       
-ngb_model = MultiModel(GCN, ngb_cpk.params.n_models, 
-                       nfeat=ngb_cpk.params.nfeat,
-                       nhid=ngb_cpk.params.nhid,
-                       nlayers=ngb_cpk.params.nlayers,
-                       nclass=ngb_cpk.params.nclass, 
-                       dropout=ngb_cpk.params.dropout)
-
-
-if args.set_seed > 0:
-    np.random.seed(args.set_seed)
-tsp_problems = np.random.uniform(size=(args.num_instances, args.tsp_size, 2))
-
-
-
-def _cuda(o):
-    return o.cuda() if args.use_cuda else o
+parser.add_argument('--solver_threshold', type=int, default=40,
+                    help='Size at which external solver takes over.')
+parser.add_argument('--no_cuda', help='Indicates not to use cuda.')
 
 
 
@@ -68,6 +46,13 @@ class TSPProblem:
         self.solution_cap = solution_cap
         self.num_leaves = 0
         self.branching_factor = branching_factor
+
+    def print_progress(self):
+        current_progress = self.subsolutions[-1].tour.size(0)
+        progress_percent = current_progress / self.size
+        progress_out_of_20 = math.floor(progress_percent * 20)
+        pbar = '#'*progress_out_of_20 + ' '*(20 - progress_out_of_20)
+        print(f'\r[{pbar}]', end='')
 
     @staticmethod
     def distance_adj(graph):
@@ -89,18 +74,33 @@ class TSPProblem:
         feats = torch.cat(multi_feats, dim=0)
         partitions = []
         current_start = 0
-        for adj in multi_sparse_adj:
-            size = adj.size(0)
+        for indices, values, size in multi_sparse_adj:
             partitions.append((current_start, current_start + size))
             current_start += size
-        full_adj = dataprocess.TSPDirectionDataloader.combine_adjacencies(multi_sparse_adj)
+        full_adj = TSPProblem.combine_sparse_parts(multi_sparse_adj)
         return feats, full_adj, partitions
+
+    @staticmethod
+    def combine_sparse_parts(multi_sparse_parts):
+        """combines adjacency matrices into one graph of multiple components"""
+        cum_size = 0
+        cum_indices = None
+        cum_values = None
+        for indices, values, size in multi_sparse_parts:
+            indices = indices + cum_size
+            cum_indices = indices if cum_indices is None else torch.cat([cum_indices, indices], dim=1)
+            cum_values = values if cum_values is None else torch.cat([cum_values, values])
+            cum_size += size
+
+        t = torch.sparse.FloatTensor(cum_indices, cum_values, (cum_size, cum_size))
+        return t
 
     def fill_to_model_buffer(self):
         self.to_model_buffer = []
         input_size = 0
         while (len(self.subproblem_stack) > 0 and 
-               input_size + self.subproblem_stack[-1].subproblem_size <= self.max_input_size):
+               input_size + self.subproblem_stack[-1].subproblem_size <= self.max_input_size) or \
+               len(self.to_model_buffer) == 0: 
             input_size += self.subproblem_stack[-1].subproblem_size
             self.to_model_buffer.append(self.subproblem_stack.pop(-1))
 
@@ -115,18 +115,18 @@ class TSPProblem:
         feats = torch.cat(multi_feats, dim=0)
         partitions = []
         current_start = 0
-        for adj in multi_sparse_adj:
-            size = adj.size(0)
+        for _, _, size in multi_sparse_adj:
             partitions.append((current_start, current_start + size))
             current_start += size
-        full_adj = dataprocess.TSPDirectionDataloader.combine_adjacencies(multi_sparse_adj)
+        full_adj = TSPProblem.combine_sparse_parts(multi_sparse_adj)
         return feats, full_adj, partitions
 
     def sample_directions(self, dir_output):
+        dir_output = dir_output.mean(1)
         branching = min(self.branching_factor, dir_output.size(0), self.solution_cap - self.num_leaves + 1)
+        self.num_leaves += branching - 1
         sample = np.random.choice(np.arange(dir_output.size(0)), size=branching, replace=False)
-        sample = torch.tensor(sample)
-
+        sample = torch.tensor(sample).long()
         sampled_dirs = dir_output[sample]
         return sampled_dirs
 
@@ -157,22 +157,35 @@ class TSPProblem:
 
     def create_solutions_and_add_new_problems(self, ngb_outputs, directions, parent_probs):
         for output, prob, direction in zip(ngb_outputs, parent_probs, directions):
-            mask = (output > 0.5).long()
-            mask_indices = mask.nonzero()
-            orig_prob_mask = prob.masked_to_unmasked[mask_indices]
+            output = output[0].flatten()
+            output[prob.unmasked_to_masked[prob.end]] = -1000000
+            mask = (torch.sigmoid(output) > 0.5).long()
+            if prob.unmasked_to_masked[prob.current] != -1:
+                mask[prob.unmasked_to_masked[prob.current]] = 0  # don't include current in neighborhood (will be added by subsolution)
+            if mask.sum() > 40:
+                mask_indices = output.topk(k=40).indices
+            elif mask.sum() < 10:
+                mask_indices = output.topk(k=10).indices
+            else:
+                mask_indices = mask.nonzero().flatten()
+            orig_prob_mask = prob.masked_to_unmasked[mask_indices].flatten()
             sub_solution = SubSolution(self, prob, orig_prob_mask, prob.current, direction)
             solved = sub_solution.solve()
             self.subsolutions.append(sub_solution)
-            if not solved:
+            self.print_progress()
+            if not solved and mask_indices.size(0) > 0:
                 new_mask, new_cur, end = sub_solution.get_new_problem_params()
+                if new_mask.sum() == 0:
+                    breakpoint()
                 new_problem = SubProblem(self, sub_solution, new_mask, new_cur, end)
                 self.subproblems.append(new_problem)
-                self.subproblem_stack.append(new_problem)
-
-            
+                self.subproblem_stack.append(new_problem)            
 
     def solve(self):
-        starter_problem = SubProblem(self, None, torch.ones(self.size), 0, 0)
+        start = time.time()
+        starter_solution = SubSolution(self, None, None, None, None)
+        starter_solution.tour = torch.tensor([]).long()
+        starter_problem = SubProblem(self, starter_solution, torch.ones(self.size), 0, 0)
         self.num_leaves = 1
         self.subproblems.append(starter_problem)
         self.subproblem_stack.append(starter_problem)
@@ -186,6 +199,14 @@ class TSPProblem:
             outputs = self.split_outputs(ngb_output, partitions)
             self.create_solutions_and_add_new_problems(outputs, directions, parents)
 
+        solutions = [s for s in self.subsolutions if s.solved]
+        best_solution = torch.tensor([s.tour_len() for s in solutions]).argmin().numpy()
+        best_solution_length = solutions[best_solution].tour_len().numpy().item()
+        GS_end = time.time()
+        solutions[best_solution].two_opt()
+        local_opt_best_solution_length = solutions[best_solution].tour_len().numpy().item()
+        GS_2OPT_end = time.time()
+        return best_solution_length, local_opt_best_solution_length, GS_end-start, GS_2OPT_end-start
 
 
 
@@ -194,12 +215,12 @@ class SubProblem:
         self.tsp_problem = tsp_problem
         self.parent_solution = parent_solution
         self.mask = mask
-        self.mask_indices = torch.nonzero(self.mask).flatten()
+        self.mask_indices = self.mask.nonzero().flatten()
         self.subproblem_size = self.mask_indices.size(0)
         self.current = current
         self.end = end 
         self.feats = None 
-        self.sparse_adj = None
+        self.sparse_adj = None  # stored in sparse parts format (indices, values, size)
         self.scale_factor = None
         self.translation_factor = None
         self.unmasked_to_masked = None 
@@ -212,8 +233,8 @@ class SubProblem:
 
         mask_indices = self.mask_indices
         subsize = mask_indices.size(0)
-        masked_to_unmasked = torch.arange(size)[mask_indices]  # original ids of nodes prior to masking
-        unmasked_to_masked = mask_indices[:]
+        masked_to_unmasked = mask_indices  # original idxs of nodes prior to masking
+        unmasked_to_masked = -torch.ones(size).long()
         unmasked_to_masked[mask_indices] = torch.arange(subsize)
 
         subinstance = instance[mask_indices]
@@ -226,8 +247,8 @@ class SubProblem:
         normalized_adj = self.normalize_adj(weighted)
 
         sparse_adj = dataprocess.TSPDirectionDataloader.to_sparse_parts(normalized_adj)
-        cur_one_hot = torch.eye(subsize)[unmasked_to_masked[self.current]]
-        final_dest_one_hot = torch.eye(subsize)[unmasked_to_masked[self.end]]
+        cur_one_hot = torch.eye(subsize)[unmasked_to_masked[self.current]].unsqueeze(1)
+        final_dest_one_hot = torch.eye(subsize)[unmasked_to_masked[self.end]].unsqueeze(1)
 
         final_dest_coord = subinstance[unmasked_to_masked[self.end]]
         final_dest_coord = final_dest_coord.repeat(subsize).reshape(-1,2)
@@ -263,21 +284,57 @@ class SubSolution:
         self.direction = direction
         self.parent_prob = parent_prob
         self.tour = None
+        self.solved = False
+
+    def tour_len(self):
+        total_dist = 0
+        distances = self.tsp_problem.distances
+        for node, next_node in zip(self.tour[:-1], self.tour[1:]):
+            total_dist += distances[node, next_node]
+        return total_dist
+
 
     def solve(self):
         coords = self.tsp_problem.coords[self.neighborhood_mask]
-        coords = torch.cat([self.tsp_problem.coords[self.parent_prob.current], coords], dim=0)
+        coords = torch.cat([self.tsp_problem.coords[self.parent_prob.current].unsqueeze(0), coords], dim=0)
         coords = (coords + self.parent_prob.translation_factor) * self.parent_prob.scale_factor
         tour, _ = gurubi.solve_gs_subtour(coords, self.direction, 0)
-        self.tour = self.neighborhood_mask[tour[1:]]
-        return false  # TODO: return whether solved or not
+        tour = torch.tensor(tour)[1:] - 1  # remove current node
+        self.tour = self.neighborhood_mask[tour]
+        self.tour = torch.cat([self.parent_prob.parent_solution.tour, self.tour])
+
+        if self.tsp_problem.size - self.tour.size(0) <= args.solver_threshold:
+            self.solve_to_completion()
+            return True
+        else:
+            return False
+
+    def solve_to_completion(self):
+        new_mask, new_current, end = self.get_new_problem_params()
+        new_mask[end] = 0
+        new_neighborhood_mask = new_mask.nonzero().flatten()
+        if new_neighborhood_mask.size(0) > 0:
+            coords = self.tsp_problem.coords[new_neighborhood_mask]
+            coords = torch.cat([self.tsp_problem.coords[new_current].unsqueeze(0), coords], dim=0)
+            # Don't need to translate as final node is just coordinates (not direction in translated space)
+            end_coord = self.tsp_problem.coords[end]
+            tour, _ = gurubi.solve_gs_subtour(coords, end_coord, 0)
+            tour = torch.tensor(tour)[1:] - 1  # remove current node
+            self.tour = torch.cat([self.tour, new_neighborhood_mask[tour], torch.tensor([end])], dim=0)
+        else:
+            self.tour = torch.cat([self.tour, torch.tensor([end])])
+        self.solved = True
 
     def get_new_problem_params(self):
         new_current = self.tour[-1]
-        new_mask = self.parent_prob.mask
+        new_mask = self.parent_prob.mask.clone()
         new_mask[self.neighborhood_mask] = 0
         end = self.parent_prob.end
         return new_mask, new_current, end
+
+    def two_opt(self):
+        improved_tour = two_opt(list(self.tour.numpy()), self.tsp_problem.distances)
+        self.tour = torch.tensor(improved_tour)
     
 
 
@@ -286,7 +343,73 @@ class SubSolution:
 
 
 
+if __name__ == "__main__":
+    args = parser.parse_args()
+    args.cuda = not args.no_cuda and torch.cuda.is_available()
+    DEVICE = 'cuda' if args.cuda else 'cpu'
 
+    dir_cpk = torch.load(args.dir_model,  map_location=torch.device(DEVICE))
+    ngb_cpk = torch.load(args.neighbor_model, map_location=torch.device(DEVICE))
+
+    dir_model = MultiModel(GCN, dir_cpk['model_params']['n_models'], 
+                        nfeat=dir_cpk['model_params']['nfeat'],
+                        nhid=dir_cpk['model_params']['nhid'],
+                        nlayers=dir_cpk['model_params']['nlayers'],
+                        nclass=dir_cpk['model_params']['nclass'], 
+                        dropout=dir_cpk['model_params']['dropout'])
+                        
+    ngb_model = MultiModel(GCN, ngb_cpk['model_params']['n_models'], 
+                        nfeat=ngb_cpk['model_params']['nfeat'],
+                        nhid=ngb_cpk['model_params']['nhid'],
+                        nlayers=ngb_cpk['model_params']['nlayers'],
+                        nclass=ngb_cpk['model_params']['nclass'], 
+                        dropout=ngb_cpk['model_params']['dropout'])
+
+    torch.no_grad()
+    dir_model.eval()
+    ngb_model.eval()
+
+    if args.set_seed > 0:
+        np.random.seed(args.set_seed)
+    tsp_problems = np.random.uniform(size=(args.num_instances, args.tsp_size, 2))
+
+
+
+    def _cuda(o):
+        return o.cuda() if args.use_cuda else o
+
+    gs_results = []
+    gs_2opt_results = []
+    gs_times = []
+    gs_2opt_times = []
+
+    for i, p in enumerate(tsp_problems):
+        problem = TSPProblem(torch.tensor(p).float(), max_input_size=50000, solution_cap=args.max_solutions, 
+                             branching_factor=args.max_expansion)
+        gs, gs_2opt, gs_time, gs_2opt_time = problem.solve()
+        gs_results.append(gs)
+        gs_2opt_results.append(gs_2opt)
+        gs_times.append(gs_time)
+        gs_2opt_times.append(gs_2opt_time)
+        with open('temp_results.json', 'w') as f:
+            json.dump({
+                'gs_results': gs_results,
+                'gs_2opt_results': gs_2opt_results,
+                'gs_times': gs_times,
+                'gs_2opt_times': gs_2opt_times
+            }, f)
+        print(f'Finished instance {i+1} / {len(tsp_problems)}')
+    gs_results = torch.tensor(gs_results)
+    gs_2opt_results = torch.tensor(gs_2opt_results)
+    gs_times = torch.tensor(gs_times)
+    gs_2opt_times = torch.tensor(gs_2opt_times)
+
+    print('\n')
+    print(f'GS: {gs_results.mean()}')
+    print(f'GS_2OPT: {gs_2opt_results.mean()}')
+    print(f'Time GS: {gs_times.mean()}')
+    print(f'Time GS_2Opt: {gs_2opt_times.mean()}')
+                            
 
 
 

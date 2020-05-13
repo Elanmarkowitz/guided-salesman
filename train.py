@@ -8,6 +8,7 @@ import time
 import argparse
 import numpy as np
 from tqdm.auto import tqdm
+import json 
 
 import torch
 import torch.nn.functional as F
@@ -38,6 +39,8 @@ parser.add_argument('--weight_decay', type=float, default=5e-4,
                     help='Weight decay (L2 loss on parameters).')
 parser.add_argument('--hidden', type=int, default=16,
                     help='Number of hidden units.')
+parser.add_argument('--nlayers', type=int, default=2,
+                    help='Number of Graph Conv layers in model')
 parser.add_argument('--dropout', type=float, default=0.5,
                     help='Dropout rate (1 - keep probability).')
 parser.add_argument('--train_direction', action='store_true', default=False,
@@ -70,10 +73,13 @@ def save_checkpoint(model, opt, epoch, trainingtype, diversity_loss):
     if args.checkpoint_dir is not None:
         if not os.path.isdir(args.checkpoint_dir):
             os.mkdir(args.checkpoint_dir)
+        if not os.path.isfile(os.path.join(args.checkpoint_dir, 'model_params.json')):
+            with open(os.path.join(args.checkpoint_dir, 'model_params.json'), 'w') as f:
+                json.dump(model.params, f)
         filename = f'{args.model_name}_{trainingtype}_{epoch}.cpk'
         filename = os.path.join(args.checkpoint_dir, filename)
         state = {'epoch': epoch, 'state_dict': model.state_dict(),
-                 'optimizer': opt.state_dict()}
+                 'optimizer': opt.state_dict(), 'model_params': model.params}
         torch.save(state, filename)
 
 def load_checkpoint(model, optimizer):
@@ -94,7 +100,7 @@ def load_checkpoint(model, optimizer):
             print("=> no checkpoint found at '{}'".format(filename))
     return start_epoch
         
-def train(model, dataloader, epochs, optimizer, trainingtype, use_diversity_loss=True):
+def train(model, dataloader, epochs, optimizer, trainingtype, use_diversity_loss=True, start_epoch=0):
     start_epoch = load_checkpoint(model, optimizer)
     if args.cuda:
         model.cuda()
@@ -104,7 +110,7 @@ def train(model, dataloader, epochs, optimizer, trainingtype, use_diversity_loss
         t = time.time()
         model.train()
 
-        for features, full_adj, labels, graph_sizes in dataloader:
+        for i, (features, full_adj, labels, graph_sizes) in enumerate(dataloader):
             pbar.update(1)
             if args.cuda:
                 features = features.cuda()
@@ -131,7 +137,7 @@ def train(model, dataloader, epochs, optimizer, trainingtype, use_diversity_loss
                     loss = F.binary_cross_entropy_with_logits(outpreds, labs)
                     acc = ((F.sigmoid(outpreds.mean(0)) - label).abs() < 0.5).sum().float() / label.size(0)
                     mean_acc.append(acc)
-                if use_diversity_loss:
+                if use_diversity_loss and i % 10 != 0:  # prevent starvation of models
                     loss = torch.min(loss)
                 else:
                     loss = torch.sum(loss)
@@ -173,9 +179,10 @@ def test():
 
 if args.train_direction:
     # Model and optimizer
-    dir_model = MultiModel(GCN, 3, 
+    dir_model = MultiModel(GCN, 6, 
                            nfeat=6,  # current node, final node, final coords (x,y), x-coord, y-coord
                            nhid=args.hidden,
+                           nlayers=args.nlayers,
                            nclass=2,  # direction 
                            dropout=args.dropout)
     optimizer = optim.Adam(dir_model.parameters(),
@@ -188,6 +195,7 @@ if args.train_neighborhood:
     nbr_model = MultiModel(GCN, 1, 
                            nfeat=8,  # current node, final node, final-node coords, x-coord, y-coord, dir-node coords
                            nhid=args.hidden,
+                           nlayers=args.nlayers,
                            nclass=1,  # binary, in neighborhood 
                            dropout=args.dropout)
     optimizer = optim.Adam(nbr_model.parameters(),

@@ -11,13 +11,30 @@ class TSPDataset(Dataset):
 
     def __init__(self, datadir):
         self.datadir = datadir 
-        self.problem_names, self.graphs, self.tours, self.cur_nodes = self._create_training_data()
+        self.problem_names, self.graphs, self.tours, self.cur_nodes, self.adjacencies  = \
+            self._create_training_data()
 
     def __len__(self):
         return len(self.problem_names)
 
     def __getitem__(self, idx):
-        return self.graphs[idx], self.cur_nodes[idx], self.tours[idx]
+        return self.graphs[idx], self.cur_nodes[idx], self.tours[idx], self.adjacencies[idx]
+
+    def weighted_adj_from_pos(self, graph):
+        """
+        Constucts a weighted, normalized adjacency matrix from the node coordinates
+        graph: |G| x 2 tensor
+        returns: |G| x |G| tensor
+        """
+        size = graph.size(0)
+        g1 = graph.unsqueeze(0).float()
+        g2 = graph.unsqueeze(1).float()
+        distances = (g1 - g2).norm(p=2, dim=2)
+        weighted = 1 / distances
+        weighted[torch.isinf(weighted)] = 0.0  # replace Infs (duplicate points and self-distances)
+        # TODO: May want to experiment with non row-based normalization
+        normalized = weighted / weighted.sum(0).expand_as(weighted).T
+        return normalized
 
     def _create_training_data(self):
         datadir = self.datadir
@@ -25,6 +42,7 @@ class TSPDataset(Dataset):
         graphs = []  
         tours = []
         cur_nodes = []
+        adjacencies = []
         for filename in os.listdir(datadir):
             name, ext = os.path.splitext(filename)
             tourpath = f'{name}.opt.tour'
@@ -42,6 +60,8 @@ class TSPDataset(Dataset):
                 for i in range(1, problem.dimension + 1):
                     graph.append(problem.node_coords[i])
                 
+                adj = self.weighted_adj_from_pos(torch.tensor(graph))
+
                 tour = tsp.load(os.path.join(datadir, tourpath))
                 if np.array(tour.tours).shape[0] > 1: 
                     print(tour.name)
@@ -56,6 +76,7 @@ class TSPDataset(Dataset):
                     tours.append(curtour)
                     cur_nodes.append(curnode)
                     problems.append(problem.name)
+                    adjacencies.append(adj)
 
                 opttour = opttour[::-1]  # repeat for reversed tour
                 for i in range(len(opttour)):
@@ -66,8 +87,9 @@ class TSPDataset(Dataset):
                     tours.append(curtour)
                     cur_nodes.append(curnode)
                     problems.append(problem.name)
+                    adjacencies.append(adj)
 
-        return np.array(problems), np.array(graphs), np.array(tours), np.array(cur_nodes)
+        return np.array(problems), np.array(graphs), np.array(tours), np.array(cur_nodes), adjacencies
 
 
 class TSPDirectionDataloader(DataLoader):
@@ -86,7 +108,9 @@ class TSPDirectionDataloader(DataLoader):
         features = []
         ys = []
         graph_sizes = []
-        for graph, cur, tour in batch:
+
+        for graph, cur, tour, adj in batch:
+            adj = self._cuda(adj)
             graph = self._cuda(torch.tensor(graph))
             tour = self._cuda(torch.tensor(tour))
 
@@ -110,7 +134,8 @@ class TSPDirectionDataloader(DataLoader):
             final_dest_coord = graph[-1]
             final_dest_coord = final_dest_coord.repeat(graph.size(0)).reshape(-1,2)
             feat = torch.cat([cur_one_hot, final_dest_one_hot, final_dest_coord, graph], dim=1)
-            A = self.weighted_adj_from_pos(graph)
+            A = adj[tour,:][:,tour]
+            A = self.renormalize_adj(A)
             adjacencies.append(A)
             features.append(feat)
             direction = graph[self.L_steps]
@@ -118,18 +143,21 @@ class TSPDirectionDataloader(DataLoader):
             graph_start = 0 if graph_sizes == [] else graph_sizes[-1][1]
             graph_stop = graph_start + graph.size(0)
             graph_sizes.append((graph_start, graph_stop))
+        
         full_adjacency = self.combine_adjacencies(adjacencies)
         full_feats = torch.cat(features)
 
         return full_feats, full_adjacency, ys, graph_sizes
 
     @staticmethod
-    def to_sparse_parts(x):
+    def to_sparse_parts(x, cutoff=0.01):
         """ converts dense tensor x to sparse format 
         Assumes square matrix (adj)
+        Removes small values
         """
+        x[x < cutoff] = 0.0
         indices = torch.nonzero(x).T
-        values = x[tuple(indices[i] for i in range(indices.shape[0]))]
+        values = x[indices[0], indices[1]]
         return indices, values, x.size(0)
 
     @staticmethod
@@ -145,7 +173,8 @@ class TSPDirectionDataloader(DataLoader):
             cum_values = values if cum_values is None else torch.cat([cum_values, values])
             cum_size += size
 
-        return torch.sparse.FloatTensor(cum_indices, cum_values, (cum_size, cum_size))
+        t = torch.sparse.FloatTensor(cum_indices, cum_values, (cum_size, cum_size))
+        return t
 
     @staticmethod
     def sample_tour_len(tour, min_length):
@@ -165,26 +194,15 @@ class TSPDirectionDataloader(DataLoader):
         rotation_matrix = self._cuda(torch.tensor([[c, -s], [s, c]]))
         return torch.mm(graph, rotation_matrix)
 
-    def weighted_adj_from_pos(self, graph):
-        """
-        Constucts a weighted, normalized adjacency matrix from the node coordinates
-        graph: |G| x 2 tensor
-        returns: |G| x |G| tensor
-        """
-        size = graph.size(0)
-        g1 = graph.unsqueeze(0)
-        g2 = graph.unsqueeze(1)
-        distances = (g1 - g2).norm(p=2, dim=2)
-        weighted = 1 / distances
-        weighted[torch.isinf(weighted)] = 0.0  # replace Infs (duplicate points and self-distances)
-        # TODO: May want to experiment with non row-based normalization
-        normalized = weighted / weighted.sum(0).expand_as(weighted).T
-        normalized = normalized / 2
+    def renormalize_adj(self, adj):
+        # Renormalize adj and add self-loops
+        size = adj.size(0)
+        adj = adj / adj.sum(0).expand_as(adj).T
+        adj = adj / 2
         if True:  # self-loops?
             idx_range = self._cuda(torch.arange(size))
-            normalized[idx_range, idx_range] = self._cuda(torch.ones(size)) / 2
-        return normalized
-
+            adj[idx_range, idx_range] = self._cuda(torch.ones(size)) / 2
+        return adj 
 
 class TSPNeighborhoodDataloader(TSPDirectionDataloader):
 
@@ -193,12 +211,15 @@ class TSPNeighborhoodDataloader(TSPDirectionDataloader):
         self.L_steps = L_steps
         self.collate_fn = self._collate_fn
 
+    # TODO: "context vector" also involves rotating and scaling s.t. intermediate destination is always at fixed point (e.g. (1,0)).
+
     def _collate_fn(self, batch):
         adjacencies = []
         features = []
         neighborhoods = []
         graph_sizes = []
-        for graph, cur, tour in batch:
+        for graph, cur, tour, adj in batch:
+            adj = self._cuda(adj)
             graph = self._cuda(torch.tensor(graph))
             tour = self._cuda(torch.tensor(tour))
 
@@ -232,7 +253,8 @@ class TSPNeighborhoodDataloader(TSPDirectionDataloader):
             final_dest_coord = graph[-1]
             final_dest_coord = final_dest_coord.repeat(graph.size(0)).reshape(-1,2)
             feat = torch.cat([cur_one_hot, final_dest_one_hot, final_dest_coord, graph, direction], dim=1)
-            A = self.weighted_adj_from_pos(graph)
+            A = adj[tour, :][:, tour]
+            A = self.renormalize_adj(A)
             adjacencies.append(A)
             features.append(feat)
             neighborhoods.append(neighborhood_label)
@@ -251,10 +273,6 @@ class TSPNeighborhoodDataloader(TSPDirectionDataloader):
         step_count = min([tour.size(0)-1, int(np.round(step_count))])
         node =  tour[step_count]
         return node, step_count
-    
-
-        
-
         
 if __name__ == '__main__':
     dataset = TSPDataset(DATADIR)
